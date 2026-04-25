@@ -1,1 +1,188 @@
+"""
+INSTAGRAM SCRAPER | ULTIMOS 10 POSTS + GEMINI IA
+Plan simplificado: Sin Excel, sin gráficas, sin links
+Prompt personalizado por el usuario
+"""
 
+from instagrapi import Client
+from collections import defaultdict
+import google.generativeai as genai
+import time
+import sys
+
+# ==================== CONFIGURACIÓN ====================
+DIAS = {0:"Lunes",1:"Martes",2:"Miercoles",3:"Jueves",4:"Viernes",5:"Sabado",6:"Domingo"}
+API_KEY = "AIzaSyABYkhwcOn9braUFNCAYh5nH7S0RrVvCT0"
+
+# Configurar Gemini con detección automática de modelo
+genai.configure(api_key=API_KEY)
+for modelo in genai.list_models():
+    if 'generateContent' in modelo.supported_generation_methods:
+        MODELO = genai.GenerativeModel(modelo.name)
+        print(f"✅ Usando modelo: {modelo.name}")
+        break
+else:
+    print("❌ No se encontró modelo compatible")
+    sys.exit(1)
+
+
+# ==================== CONEXIÓN A INSTAGRAM ====================
+def conectar() -> Client:
+    """Autenticación vía cookies del navegador"""
+    cl = Client()
+    cookies = {
+        "sessionid": input("sessionid: ").strip(),
+        "csrftoken": input("csrftoken: ").strip(),
+        "ds_user_id": input("ds_user_id: ").strip()
+    }
+    cl.set_settings({"cookies": cookies})
+    cl.login_by_sessionid(cookies["sessionid"])
+    print("✅ Conectado")
+    return cl
+
+
+# ==================== EXTRACCIÓN DE DATOS ====================
+def extraer_ultimos_10(cl: Client, username: str) -> tuple:
+    """Obtiene perfil + últimos 10 posts + 5 comentarios por post"""
+    uid = cl.user_id_from_username(username)
+    perfil = cl.user_info(uid)
+    
+    print(f"📡 Extrayendo últimos 10 posts de @{username}...")
+    posts = []
+    
+    for i, media in enumerate(cl.user_medias(uid, 10), 1):
+        # Datos básicos del post
+        post = {
+            "numero": i,
+            "descripcion": (media.caption_text or "Sin descripcion")[:200],
+            "fecha": media.taken_at.strftime('%d/%m/%Y'),
+            "hora": media.taken_at.hour,
+            "dia": DIAS[media.taken_at.weekday()],
+            "likes": media.like_count,
+            "comentarios_count": media.comment_count,
+            "tipo": "Video" if media.media_type == 2 else "Foto"
+        }
+        
+        # Extraer comentarios
+        try:
+            comentarios_raw = cl.media_comments(media.id, amount=5)
+            post["comentarios"] = [f"@{c.user.username}: {c.text[:150]}" for c in comentarios_raw]
+        except:
+            post["comentarios"] = []
+        
+        posts.append(post)
+        time.sleep(0.5)
+    
+    print(f"✅ Extraídos {len(posts)} posts")
+    return perfil, posts
+
+
+# ==================== CÁLCULO DE MÉTRICAS ====================
+def analizar(perfil, posts: list) -> dict:
+    """Calcula engagement, promedios y mejor horario"""
+    total_likes = sum(p["likes"] for p in posts)
+    total_coms = sum(p["comentarios_count"] for p in posts)
+    
+    # Engagement rate
+    eng = round((total_likes + total_coms) / perfil.follower_count * 100, 2) if perfil.follower_count else 0
+    
+    # Análisis por hora
+    por_hora = defaultdict(list)
+    for p in posts:
+        por_hora[p["hora"]].append(p["likes"] + p["comentarios_count"])
+    
+    prom_hora = {h: sum(v)/len(v) for h, v in por_hora.items()}
+    mejor_hora = max(prom_hora, key=prom_hora.get) if prom_hora else 12
+    
+    # Mejor día
+    mejor_dia = max(set(p["dia"] for p in posts), 
+                    key=lambda d: sum(p["likes"] + p["comentarios_count"] for p in posts if p["dia"] == d))
+    
+    return {
+        "engagement": eng,
+        "prom_likes": round(total_likes / len(posts), 2),
+        "prom_coms": round(total_coms / len(posts), 2),
+        "mejor_post": max(posts, key=lambda p: p["likes"]),
+        "mejor_hora": mejor_hora,
+        "mejor_dia": mejor_dia
+    }
+
+
+# ==================== PREPARAR DATOS PARA IA ====================
+def preparar_contexto(perfil, posts: list, stats: dict) -> str:
+    """Convierte todos los datos en un texto estructurado para Gemini"""
+    contexto = f"""
+PERFIL: @{perfil.username} | Seguidores: {perfil.follower_count:,} | Engagement: {stats['engagement']}%
+MÉTRICAS: Promedio likes: {stats['prom_likes']} | Mejor hora: {stats['mejor_hora']}:00h | Mejor día: {stats['mejor_dia']}
+
+ÚLTIMOS 10 POSTS:
+"""
+    for p in posts:
+        contexto += f"""
+POST {p['numero']} ({p['tipo']}) - {p['dia']} {p['hora']}:00h
+❤️ {p['likes']} likes | 💬 {p['comentarios_count']} comentarios
+📝 {p['descripcion']}
+💬 Comentarios: {' | '.join(p['comentarios'][:3]) if p['comentarios'] else 'Sin comentarios'}
+"""
+    return contexto
+
+
+# ==================== CONSULTA A GEMINI ====================
+def preguntar_a_gemini(contexto: str, pregunta: str) -> str:
+    """Envía contexto + pregunta personalizada a Gemini"""
+    try:
+        respuesta = MODELO.generate_content(f"""
+Basado EXCLUSIVAMENTE en estos datos de Instagram:
+{contexto}
+
+PREGUNTA: {pregunta}
+
+RESPONDE DE MANERA CONCISA Y DIRECTA:
+""")
+        return respuesta.text
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ==================== MOSTRAR RESULTADOS ====================
+def mostrar_datos(perfil, posts: list, stats: dict):
+    """Muestra perfil, posts y métricas en consola"""
+    print(f"\n{'='*60}")
+    print(f"📊 @{perfil.username} - {perfil.follower_count:,} seguidores")
+    print(f"📈 Engagement: {stats['engagement']}% | 👍 Promedio: {stats['prom_likes']} | 🎯 Mejor hora: {stats['mejor_hora']}:00h")
+    print(f"{'='*60}")
+    
+    for p in posts:
+        print(f"\n[{p['numero']}] {p['tipo']} | ❤️ {p['likes']} | 💬 {p['comentarios_count']} | 📅 {p['dia']} {p['hora']}:00h")
+        print(f"📝 {p['descripcion'][:100]}")
+        if p['comentarios']:
+            print(f"💬 {p['comentarios'][0][:80]}")
+
+
+# ==================== MENÚ PRINCIPAL ====================
+def main():
+    cl = conectar()
+    usuario = input("\nUsuario a analizar: ").strip().replace("@", "")
+    
+    # Extraer y analizar
+    perfil, posts = extraer_ultimos_10(cl, usuario)
+    stats = analizar(perfil, posts)
+    mostrar_datos(perfil, posts, stats)
+    
+    # Preparar contexto para IA
+    contexto = preparar_contexto(perfil, posts, stats)
+    
+    # Bucle de consultas personalizadas
+    print(f"\n{'='*60}\n🤖 MODO CONSULTAS (escribe 'salir' para terminar)\n{'='*60}")
+    
+    while True:
+        pregunta = input("\n💬 Tu pregunta: ").strip()
+        if pregunta.lower() in ['salir', 'exit', 'q']:
+            break
+        if pregunta:
+            print("🤔 Analizando...")
+            print(f"\n📌 {preguntar_a_gemini(contexto, pregunta)}\n")
+            print("-"*60)
+
+if __name__ == "__main__":
+    main()
