@@ -1,1 +1,294 @@
+"""
+TIKTOK SCRAPER | TOP 10 VIRALES + GEMINI IA
+Simplificado: Sin Excel, sin gráficas, con prompts personalizados
+"""
 
+from TikTokApi import TikTokApi
+from collections import defaultdict
+import google.generativeai as genai
+import asyncio
+import sys
+from datetime import datetime
+
+# ==================== CONFIGURACIÓN ====================
+DIAS = {0:"Lunes", 1:"Martes", 2:"Miercoles", 3:"Jueves", 4:"Viernes", 5:"Sabado", 6:"Domingo"}
+
+# ✅ NUEVA API KEY (actualizada)
+API_KEY = "AIzaSyDI1ap0ninbsxEpaOAjI2ot_IUSMveLLJ4"
+
+# Configurar Gemini con detección automática de modelo
+try:
+    genai.configure(api_key=API_KEY)
+    
+    modelo_encontrado = False
+    for modelo in genai.list_models():
+        if 'generateContent' in modelo.supported_generation_methods:
+            MODELO = genai.GenerativeModel(modelo.name)
+            print(f"✅ Usando modelo: {modelo.name}")
+            modelo_encontrado = True
+            break
+    
+    if not modelo_encontrado:
+        print("❌ No se encontró modelo compatible")
+        sys.exit(1)
+        
+except Exception as e:
+    print(f"❌ Error configurando Gemini: {e}")
+    sys.exit(1)
+
+
+# ==================== CONEXIÓN A TIKTOK ====================
+class TikTokAPI:
+    async def conectar(self, ms_token: str):
+        """Conecta usando msToken de TikTok"""
+        self.api = TikTokApi()
+        await self.api.create_sessions(ms_tokens=[ms_token], num_sessions=1, headless=True)
+        print("✅ Conectado a TikTok")
+    
+    async def get_perfil(self, username: str):
+        """Obtiene datos del perfil"""
+        user = self.api.user(username=username)
+        info = await user.info()
+        return info["userInfo"]
+    
+    async def get_videos(self, username: str, cantidad: int):
+        """Obtiene lista de videos"""
+        videos = []
+        user = self.api.user(username=username)
+        async for v in user.videos(count=cantidad):
+            videos.append(v.as_dict)
+            await asyncio.sleep(0.3)
+        return videos
+    
+    async def get_comentarios(self, video_id: str, cantidad: int = 5):
+        """Obtiene comentarios de un video"""
+        try:
+            video = self.api.video(id=video_id)
+            comentarios = []
+            async for c in video.comments(count=cantidad):
+                comentarios.append(f"@{c.user.username}: {c.text[:150]}")
+                await asyncio.sleep(0.2)
+            return comentarios
+        except Exception:
+            return []
+    
+    async def cerrar(self):
+        await self.api.close_sessions()
+
+
+# ==================== EXTRACCIÓN DE TOP 10 ====================
+async def extraer_top10(api: TikTokAPI, username: str):
+    """Extrae SOLO los 10 videos con más engagement (analiza 50, se queda con top 10)"""
+    
+    # Obtener perfil
+    raw_perfil = await api.get_perfil(username)
+    seguidores = raw_perfil["stats"]["followerCount"]
+    print(f"📊 @{username} tiene {seguidores:,} seguidores")
+    
+    # Analizar 50 videos
+    print(f"📡 Analizando 50 videos para encontrar los 10 más virales...")
+    raw_videos = await api.get_videos(username, 50)
+    
+    # Calcular score de cada video
+    todos = []
+    for v in raw_videos:
+        fecha = datetime.fromtimestamp(v["createTime"])
+        stats = v["stats"]
+        
+        score = stats["diggCount"] + stats["commentCount"] + stats["shareCount"]
+        
+        todos.append({
+            "id": v["id"],
+            "descripcion": v.get("desc", "Sin descripción")[:200],
+            "fecha": fecha.strftime('%d/%m/%Y'),
+            "hora": fecha.hour,
+            "dia": DIAS[fecha.weekday()],
+            "vistas": stats["playCount"],
+            "likes": stats["diggCount"],
+            "comentarios": stats["commentCount"],
+            "compartidos": stats["shareCount"],
+            "score": score
+        })
+        await asyncio.sleep(0.3)
+    
+    # Ordenar y quedarse con TOP 10
+    top10 = sorted(todos, key=lambda x: x["score"], reverse=True)[:10]
+    
+    # Agregar comentarios SOLO a los top 10
+    print(f"🏆 Extrayendo comentarios de los 10 videos más populares...")
+    for video in top10:
+        video["top_comments"] = await api.get_comentarios(video["id"], 5)
+        await asyncio.sleep(0.5)
+    
+    return {
+        "username": username,
+        "seguidores": seguidores,
+        "videos": top10
+    }
+
+
+# ==================== CÁLCULO DE MÉTRICAS ====================
+def analizar(datos: dict):
+    """Calcula engagement y mejor horario basado en top 10 videos"""
+    
+    videos = datos["videos"]
+    seguidores = datos["seguidores"]
+    
+    total_likes = sum(v["likes"] for v in videos)
+    total_coms = sum(v["comentarios"] for v in videos)
+    total_shares = sum(v["compartidos"] for v in videos)
+    
+    engagement = round((total_likes + total_coms + total_shares) / seguidores * 100, 2) if seguidores else 0
+    
+    por_hora = defaultdict(list)
+    por_dia = defaultdict(list)
+    
+    for v in videos:
+        eng = v["likes"] + v["comentarios"] + v["compartidos"]
+        por_hora[v["hora"]].append(eng)
+        por_dia[v["dia"]].append(eng)
+    
+    prom_hora = {h: round(sum(val)/len(val), 2) for h, val in por_hora.items()}
+    prom_dia = {d: round(sum(val)/len(val), 2) for d, val in por_dia.items()}
+    
+    mejor_hora = max(prom_hora, key=prom_hora.get) if prom_hora else 20
+    mejor_dia = max(prom_dia, key=prom_dia.get) if prom_dia else "Sábado"
+    
+    if mejor_hora < 12: franja = "mañana 🌅"
+    elif mejor_hora < 17: franja = "mediodía ☀️"
+    elif mejor_hora < 20: franja = "tarde 🌤️"
+    else: franja = "noche 🌙"
+    
+    return {
+        "engagement": engagement,
+        "prom_likes": round(total_likes / 10, 2),
+        "prom_coms": round(total_coms / 10, 2),
+        "prom_shares": round(total_shares / 10, 2),
+        "mejor_video": max(videos, key=lambda v: v["likes"]),
+        "mejor_hora": mejor_hora,
+        "mejor_dia": mejor_dia,
+        "recomendacion": f"📅 Publica los {mejor_dia}s a las {mejor_hora}:00h ({franja})",
+        "prom_hora": prom_hora,
+        "prom_dia": prom_dia
+    }
+
+
+# ==================== PREPARAR DATOS PARA IA ====================
+def preparar_contexto(datos: dict, stats: dict) -> str:
+    """Convierte todos los datos en un texto estructurado para Gemini"""
+    
+    contexto = f"""
+PERFIL TIKTOK: @{datos['username']} | Seguidores: {datos['seguidores']:,} | Engagement: {stats['engagement']}%
+
+MÉTRICAS GENERALES:
+- Promedio likes: {stats['prom_likes']:,}
+- Promedio comentarios: {stats['prom_coms']}
+- Promedio compartidos: {stats['prom_shares']:,}
+- Mejor hora: {stats['mejor_hora']}:00h
+- Mejor día: {stats['mejor_dia']}
+
+TOP 10 VIDEOS MÁS VIRALES:
+"""
+    
+    for v in datos["videos"]:
+        contexto += f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VIDEO:
+📅 {v['dia']} {v['hora']}:00h - {v['fecha']}
+❤️ Likes: {v['likes']:,} | 💬 Comentarios: {v['comentarios']} | 🔗 Shares: {v['compartidos']} | 👀 Vistas: {v['vistas']:,}
+📝 Descripción: {v['descripcion']}
+💬 Comentarios destacados: {' | '.join(v['top_comments'][:3]) if v['top_comments'] else 'Sin comentarios'}
+"""
+    
+    return contexto
+
+
+# ==================== CONSULTA A GEMINI ====================
+def preguntar_a_gemini(contexto: str, pregunta: str) -> str:
+    """Envía contexto + pregunta personalizada a Gemini"""
+    try:
+        respuesta = MODELO.generate_content(f"""
+Basado EXCLUSIVAMENTE en estos datos de TikTok:
+{contexto}
+
+PREGUNTA DEL USUARIO: {pregunta}
+
+RESPONDE DE MANERA CONCISA, PRÁCTICA Y DIRECTA:
+""")
+        return respuesta.text
+    except Exception as e:
+        return f"❌ Error en Gemini: {e}"
+
+
+# ==================== MOSTRAR RESULTADOS ====================
+def mostrar_datos(datos: dict, stats: dict):
+    """Muestra perfil, videos y métricas en consola"""
+    
+    nivel = "🔥 Excelente" if stats["engagement"] >= 6 else "✅ Bueno" if stats["engagement"] >= 3 else "⚠️ Normal" if stats["engagement"] >= 1 else "❌ Bajo"
+    
+    print(f"\n{'='*60}")
+    print(f"🎵 @{datos['username']} - {datos['seguidores']:,} seguidores")
+    print(f"📈 Engagement: {stats['engagement']}% {nivel}")
+    print(f"👍 Promedio likes: {stats['prom_likes']:,} | 💬 Coms: {stats['prom_coms']} | 🔗 Shares: {stats['prom_shares']:,}")
+    print(f"🎯 Mejor hora: {stats['mejor_hora']}:00h | Mejor día: {stats['mejor_dia']}")
+    print(f"{'='*60}")
+    
+    print("\n🏆 TOP 10 VIDEOS MÁS VIRALES:\n")
+    for i, v in enumerate(datos["videos"], 1):
+        print(f"[{i}] ❤️ {v['likes']:,} | 💬 {v['comentarios']} | 🔗 {v['compartidos']} | 👀 {v['vistas']:,}")
+        print(f"    📅 {v['dia']} {v['hora']}:00h")
+        print(f"    📝 {v['descripcion'][:100]}")
+        if v["top_comments"]:
+            print(f"    💬 {v['top_comments'][0][:80]}")
+        print()
+
+
+# ==================== MENÚ PRINCIPAL ====================
+async def main():
+    print("="*60)
+    print("  TIKTOK SCRAPER | TOP 10 VIRALES + GEMINI IA")
+    print("  Sin Excel | Sin gráficas | Prompts personalizados")
+    print("="*60)
+    
+    ms_token = input("\n🔑 msToken: ").strip()
+    
+    api = TikTokAPI()
+    await api.conectar(ms_token)
+    
+    usuario = input("\n🔍 Usuario a analizar (sin @): ").strip().lower()
+    
+    datos = await extraer_top10(api, usuario)
+    stats = analizar(datos)
+    
+    mostrar_datos(datos, stats)
+    
+    contexto = preparar_contexto(datos, stats)
+    
+    guardar = input("\n💾 ¿Guardar datos extraídos en .txt? (s/n): ").lower()
+    if guardar == 's':
+        with open(f"{usuario}_tiktok_datos.txt", "w", encoding="utf-8") as f:
+            f.write(contexto)
+        print(f"✅ Datos guardados en {usuario}_tiktok_datos.txt")
+    
+    print(f"\n{'='*60}")
+    print("🤖 MODO CONSULTAS (escribe 'salir' para terminar)")
+    print("Ejemplos: ¿Qué tipo de videos funcionan mejor?")
+    print("          ¿Qué patrones ves en los comentarios?")
+    print("          Dame 5 ideas virales basadas en estos datos")
+    print(f"{'='*60}")
+    
+    while True:
+        pregunta = input("\n💬 Tu pregunta: ").strip()
+        if pregunta.lower() in ['salir', 'exit', 'q']:
+            break
+        if pregunta:
+            print("🤔 Analizando con Gemini...")
+            print(f"\n📌 {preguntar_a_gemini(contexto, pregunta)}\n")
+            print("-"*60)
+    
+    await api.cerrar()
+    print(f"\n✅ Análisis completado: @{datos['username']}")
+    print(f"🏆 Video con más likes: {stats['mejor_video']['likes']:,} likes")
+
+if __name__ == "__main__":
+    asyncio.run(main())
